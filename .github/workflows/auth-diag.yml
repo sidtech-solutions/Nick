@@ -16,7 +16,7 @@ jobs:
       - name: Session facts
         run: |
           id -un; echo "managername (this step): $(launchctl managername)"
-          echo "managername (asuser): $(launchctl asuser "$(id -u)" /bin/launchctl managername)"
+          echo "managername (asuser): $(sudo launchctl asuser "$(id -u)" sudo -u "$(id -un)" /bin/launchctl managername)"
           who; last -3 2>/dev/null || true
           echo "--- nick right before ---"
           security authorizationdb read com.ehsanazish.nick.modify-protection 2>&1 | head -2
@@ -25,7 +25,7 @@ jobs:
       - name: Probe, right undefined
         run: |
           echo "ssh session:";  /tmp/authdiag
-          echo "aqua session:"; launchctl asuser "$(id -u)" /tmp/authdiag
+          echo "aqua session:"; sudo launchctl asuser "$(id -u)" sudo -u "$(id -un)" /tmp/authdiag
       - name: Define the right as the extension does in production
         run: |
           sudo security authorizationdb write com.ehsanazish.nick.modify-protection <<'EOF'
@@ -44,4 +44,4 @@ jobs:
       - name: Probe, right defined
         run: |
           echo "ssh session:";  /tmp/authdiag
-          echo "aqua session:"; launchctl asuser "$(id -u)" /tmp/authdiag
+          echo "aqua session:"; sudo launchctl asuser "$(id -u)" sudo -u "$(id -un)" /tmp/authdiag
