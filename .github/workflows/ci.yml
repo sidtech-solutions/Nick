@@ -177,6 +177,27 @@ jobs:
       - name: Build Nick, shipping components and tests
         run: xcodebuild build-for-testing $XCODEBUILD_FLAGS
 
+      # xcodebuild launches the test host into the console user's Aqua
+      # session. On a runner VM that auto-logged that user in moments
+      # earlier, loginwindow's credential still satisfies any *undefined*
+      # right through authd's default rule (shared, 300s). Define Nick's
+      # right exactly as the extension does in production (shared: false)
+      # so the verifier tests exercise the real rule instead of the default.
+      - name: Register the protection authorization right
+        run: |
+          sudo security authorizationdb write com.ehsanazish.nick.modify-protection <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>class</key><string>rule</string>
+            <key>rule</key><array><string>authenticate-session-owner-or-admin</string></array>
+            <key>shared</key><false/>
+            <key>timeout</key><integer>120</integer>
+          </dict>
+          </plist>
+          EOF
+
       - name: Run Tests
         run: |
           rm -rf TestResults.xcresult
