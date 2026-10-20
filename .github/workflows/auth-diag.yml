@@ -1,0 +1,38 @@
+name: auth-diag
+
+on:
+  push:
+    branches: [ci/auth-diag]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: [self-hosted, bladerunner-macos]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Session facts
+        run: |
+          id
+          echo "managername: $(launchctl managername)"
+          who; last -5 2>/dev/null || true
+          boot=$(sysctl -n kern.boottime | sed -E 's/.*sec = ([0-9]+).*/\1/'); echo "uptime: $(( $(date +%s) - boot ))s"
+          echo "--- default rule ---"
+          security authorizationdb read default 2>/dev/null | grep -A1 -E "allow-root|shared|timeout|authenticate-user|session-owner" | grep -v '^--'
+          echo "--- nick right ---"
+          security authorizationdb read com.ehsanazish.nick.modify-protection 2>&1 | head -2
+      - name: Probe now
+        run: |
+          swiftc -O -o /tmp/authdiag Scripts/ci-diag/authdiag.swift
+          /tmp/authdiag
+          /tmp/authdiag com.example.undefined.right
+          /tmp/authdiag system.preferences
+      - name: Probe after 330s uptime
+        run: |
+          boot=$(sysctl -n kern.boottime | sed -E 's/.*sec = ([0-9]+).*/\1/'); up=$(( $(date +%s) - boot ))
+          wait=$(( 340 - up )); echo "uptime ${up}s, sleeping ${wait}s"; (( wait > 0 )) && sleep "$wait"
+          echo "uptime now: $(( $(date +%s) - boot ))s"
+          /tmp/authdiag
+          /tmp/authdiag com.example.undefined.right
