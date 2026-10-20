@@ -20,39 +20,34 @@ defaults:
   run:
     shell: bash
 
+env:
+  XCODEBUILD_FLAGS: >-
+    -project Nick.xcodeproj
+    -scheme Nick
+    -destination platform=macOS
+    -clonedSourcePackagesDirPath SourcePackages
+    -enableCodeCoverage YES
+    CODE_SIGN_IDENTITY=
+    CODE_SIGNING_REQUIRED=NO
+    CODE_SIGNING_ALLOWED=NO
+    ENABLE_USER_SCRIPT_SANDBOXING=NO
+
 jobs:
-  build-and-test:
-    runs-on: macos-26
-    timeout-minutes: 45
+  # The YARA rule gate and the Xcode build share nothing, so they run as
+  # separate jobs and the workflow finishes when the slower one does.
+  yara-rules:
+    runs-on: [self-hosted, bladerunner-macos]
+    timeout-minutes: 30
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
-      - name: Detect optional CI integrations
-        id: optional-integrations
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        run: |
-          test -n "$CODECOV_TOKEN" && echo "codecov=true" >> "$GITHUB_OUTPUT" || echo "codecov=false" >> "$GITHUB_OUTPUT"
-          test -n "$SONAR_TOKEN" && echo "sonar=true" >> "$GITHUB_OUTPUT" || echo "sonar=false" >> "$GITHUB_OUTPUT"
-
-      - name: Select Xcode
-        run: |
-          XCODE_PATH="$(find /Applications -maxdepth 1 -type d -name 'Xcode*.app' | sort -V | tail -1)"
-          test -n "$XCODE_PATH"
-          sudo xcode-select -s "$XCODE_PATH"
-          xcodebuild -version
-
       - name: Set up Python for YARA
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
-
-      - name: Validate repository
-        run: ./Scripts/validate-repository.sh
 
       - name: Decide whether to run the YARA gate
         id: yara-gate
@@ -101,11 +96,27 @@ jobs:
       - name: YARA false-positive gate (benign corpus)
         if: steps.yara-gate.outputs.run == 'true'
         run: |
+          # Runner images carry several Xcode installs that are near-identical
+          # copies of each other. Scan only the selected one; the rest would
+          # multiply the corpus without adding new benign code.
+          selected="$(xcode-select -p)"
+          selected="$(cd "${selected%/Contents/Developer}" && pwd -P)"
+          excludes=()
+          skipped=0
+          for app in /Applications/Xcode.app /Applications/Xcode_*.app; do
+            [[ -d "$app" ]] || continue
+            [[ "$(cd "$app" && pwd -P)" == "$selected" ]] && continue
+            excludes+=(--exclude "$app")
+            skipped=$((skipped + 1))
+          done
+          echo "Scanning Xcode at $selected; skipping $skipped other install(s)."
+
           .ci-venv/bin/python Scripts/rules_gate.py fp \
             --root /System/Applications \
             --root /System/Library/CoreServices \
             --root /usr/bin --root /usr/libexec \
             --root /Applications \
+            "${excludes[@]}" \
             --max-files 120000 \
             --time-limit-seconds 1200 \
             --report
@@ -119,43 +130,58 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Build Nick
-        run: |
-          xcodebuild build \
-            -project Nick.xcodeproj \
-            -scheme Nick \
-            -destination "platform=macOS" \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            ENABLE_USER_SCRIPT_SANDBOXING=NO
+  build-and-test:
+    runs-on: [self-hosted, bladerunner-macos]
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
 
-      - name: Build shipping components
+      - name: Detect optional CI integrations
+        id: optional-integrations
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
-          for scheme in NickExtension NickNetFilter NickHelper NickUninstaller; do
-            xcodebuild build \
-              -project Nick.xcodeproj \
-              -scheme "$scheme" \
-              -destination "platform=macOS" \
-              CODE_SIGN_IDENTITY="" \
-              CODE_SIGNING_REQUIRED=NO \
-              CODE_SIGNING_ALLOWED=NO \
-              ENABLE_USER_SCRIPT_SANDBOXING=NO
-          done
+          test -n "$CODECOV_TOKEN" && echo "codecov=true" >> "$GITHUB_OUTPUT" || echo "codecov=false" >> "$GITHUB_OUTPUT"
+          test -n "$SONAR_TOKEN" && echo "sonar=true" >> "$GITHUB_OUTPUT" || echo "sonar=false" >> "$GITHUB_OUTPUT"
+
+      - name: Select Xcode
+        run: |
+          # Newest Xcode 26 release; fall back to the newest install of any
+          # major if the image carries no 26.x.
+          XCODE_PATH="$(find /Applications -maxdepth 1 -type d -name 'Xcode_26*.app' | sort -V | tail -1)"
+          if [[ -z "$XCODE_PATH" ]]; then
+            XCODE_PATH="$(find /Applications -maxdepth 1 -type d -name 'Xcode*.app' | sort -V | tail -1)"
+          fi
+          test -n "$XCODE_PATH"
+          sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
+
+      - name: Validate repository
+        run: ./Scripts/validate-repository.sh
+
+      - name: Cache Swift package checkouts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: SourcePackages
+          key: spm-${{ runner.os }}-${{ hashFiles('Nick.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      # One build covers Nick, every shipping component it embeds or depends
+      # on (NickExtension, NickNetFilter, NickHelper, NickUninstaller) and
+      # the test bundle, with the coverage settings the test run needs, so
+      # nothing is compiled twice.
+      - name: Build Nick, shipping components and tests
+        run: xcodebuild build-for-testing $XCODEBUILD_FLAGS
 
       - name: Run Tests
         run: |
           rm -rf TestResults.xcresult
-          xcodebuild test \
-            -project Nick.xcodeproj \
-            -scheme Nick \
-            -destination "platform=macOS" \
-            -enableCodeCoverage YES \
-            -resultBundlePath TestResults.xcresult \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            ENABLE_USER_SCRIPT_SANDBOXING=NO
+          xcodebuild test-without-building $XCODEBUILD_FLAGS \
+            -resultBundlePath TestResults.xcresult
 
       - name: Test Summary
         if: always()

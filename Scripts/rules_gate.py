@@ -11,7 +11,9 @@ Quality gate for Nick's bundled YARA rules.
 
   fp    Scan a benign corpus (default: Apple and installed applications) and
         fail if any class="signature" rule matches. Behaviour-rule matches are
-        reported per rule so noisy heuristics are visible in review.
+        reported per rule so noisy heuristics are visible in review. Files are
+        scanned on every CPU by default (--jobs); --exclude prunes directory
+        trees such as duplicate Xcode installs on CI images.
 
 Requires yara-python (pip install yara-python==4.5.4), which bundles the same
 libyara 4.5.x release Nick vendors.
@@ -20,6 +22,7 @@ libyara 4.5.x release Nick vendors.
 import argparse
 import collections
 import json
+import multiprocessing
 import os
 import re
 import sys
@@ -100,49 +103,87 @@ def is_candidate(path, size_limit):
     return head in MACHO_MAGICS or head[:2] == b"#!" or bool(st.st_mode & 0o111)
 
 
-def fp(roots, max_files, size_limit, write_report, time_limit_seconds):
+def candidates(roots, excludes, size_limit, max_files, deadline):
+    """Yield benign candidate paths; stops early with a reason string."""
+    excludes = tuple(os.path.normpath(e) for e in excludes)
+    yielded = 0
+    for root in roots:
+        if not os.path.exists(root):
+            continue
+        for base, dirs, names in os.walk(root):
+            if deadline is not None and time.monotonic() >= deadline:
+                return "timeout"
+            dirs[:] = [d for d in dirs
+                       if d != ".git" and os.path.join(base, d) not in excludes]
+            for name in names:
+                if yielded >= max_files:
+                    return "limit"
+                path = os.path.join(base, name)
+                if is_candidate(path, size_limit):
+                    yielded += 1
+                    yield path
+    return None
+
+
+_WORKER_RULES = None
+
+
+def _worker_init():
+    global _WORKER_RULES
+    _WORKER_RULES, _ = compile_rules()
+
+
+def _scan_one(path):
+    try:
+        return [(m.rule, path) for m in _WORKER_RULES.match(path, timeout=10, fast=True)]
+    except yara.Error:
+        return []
+
+
+def fp(roots, max_files, size_limit, write_report, time_limit_seconds, jobs=None, excludes=()):
     rules, _ = compile_rules()
     classes = {r.identifier: str(r.meta.get("class", "")).lower() for r in rules}
     signature_hits, behavior_hits = [], collections.defaultdict(list)
     scanned = 0
     deadline = time.monotonic() + time_limit_seconds if time_limit_seconds else None
     timed_out = False
-    limit_reached = False
-    for root in roots:
-        if not os.path.exists(root):
-            continue
-        for base, dirs, names in os.walk(root):
-            if deadline is not None and time.monotonic() >= deadline:
-                timed_out = True
-                break
-            dirs[:] = [d for d in dirs if d not in (".git",)]
-            for name in names:
-                if scanned >= max_files:
-                    limit_reached = True
-                    break
-                if deadline is not None and time.monotonic() >= deadline:
-                    timed_out = True
-                    break
-                path = os.path.join(base, name)
-                if not is_candidate(path, size_limit):
-                    continue
+    jobs = jobs or os.cpu_count() or 1
+
+    def record(hits):
+        for rule, path in hits:
+            if classes.get(rule) == "signature":
+                signature_hits.append((rule, path))
+            else:
+                behavior_hits[rule].append(path)
+
+    gen = candidates(roots, excludes, size_limit, max_files, deadline)
+    stop_reason = None
+
+    def paths():
+        nonlocal stop_reason
+        stop_reason = yield from gen
+
+    if jobs <= 1:
+        _worker_init()
+        for path in paths():
+            scanned += 1
+            record(_scan_one(path))
+    else:
+        # Workers compile the rule set once each; the parent only walks the
+        # corpus and tallies results. Chunks keep the IPC overhead low on
+        # corpora of tens of thousands of small Mach-O files.
+        with multiprocessing.Pool(jobs, initializer=_worker_init) as pool:
+            for hits in pool.imap_unordered(_scan_one, paths(), chunksize=16):
                 scanned += 1
-                try:
-                    matches = rules.match(path, timeout=10, fast=True)
-                except yara.Error:
-                    continue
-                for m in matches:
-                    if classes.get(m.rule) == "signature":
-                        signature_hits.append((m.rule, path))
-                    else:
-                        behavior_hits[m.rule].append(path)
-            if timed_out or limit_reached:
-                break
-        if timed_out or limit_reached:
-            break
-    print(f"Scanned {scanned} benign candidate files.")
-    for rule, paths in sorted(behavior_hits.items(), key=lambda kv: -len(kv[1])):
-        print(f"  behavior {rule}: {len(paths)} match(es), e.g. {paths[0]}")
+                record(hits)
+                if deadline is not None and time.monotonic() >= deadline:
+                    stop_reason = "timeout"
+                    pool.terminate()
+                    break
+    timed_out = stop_reason == "timeout"
+    print(f"Scanned {scanned} benign candidate files with {jobs} worker(s).")
+    for rule, paths_ in sorted(behavior_hits.items(), key=lambda kv: -len(kv[1])):
+        print(f"  behavior {rule}: {len(paths_)} match(es), e.g. {paths_[0]}")
     for rule, path in signature_hits:
         print(f"error: signature rule {rule} matched benign file {path}", file=sys.stderr)
     if timed_out:
@@ -170,11 +211,15 @@ def main():
                      help="fail after this many seconds (0 disables the limit)")
     fpp.add_argument("--report", action="store_true",
                      help="write yara-fp-report.json in the repository root")
+    fpp.add_argument("--jobs", type=int, default=0,
+                     help="parallel scan workers (default: all CPUs; 1 scans in-process)")
+    fpp.add_argument("--exclude", action="append", default=[],
+                     help="directory to skip, e.g. a duplicate Xcode install (repeatable)")
     args = parser.parse_args()
     if args.command == "lint":
         return lint()
     return fp(args.root or DEFAULT_CORPUS, args.max_files, args.size_limit_mb * 1024 * 1024,
-              args.report, args.time_limit_seconds)
+              args.report, args.time_limit_seconds, args.jobs, args.exclude)
 
 
 if __name__ == "__main__":

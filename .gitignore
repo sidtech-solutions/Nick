@@ -5,6 +5,7 @@
 xcuserdata/
 *.xcuserdata/
 DerivedData/
+SourcePackages/
 build/
 *.moved-aside
 *.hmap
